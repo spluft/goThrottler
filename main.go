@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/rand"
@@ -52,7 +53,14 @@ type Config struct {
 	RequireAuth    bool
 	StatsPath      string
 	MetricsPath    string
+	CacheTTL       time.Duration   // DISCOVERY_CACHE_TTL_SECONDS; 0 disables the cache
+	CachePaths     map[string]bool // exact GET paths served from the discovery cache
 }
+
+const (
+	defaultCacheTTL   = 300 // seconds
+	defaultCachePaths = "/v1/models,/version,/api/tags,/v1/props"
+)
 
 func loadConfig() (*Config, error) {
 	up, err := url.Parse(getEnv("UPSTREAM_URL", "http://new-api:3000"))
@@ -70,6 +78,8 @@ func loadConfig() (*Config, error) {
 		RequireAuth:    envInt("REQUIRE_AUTH", 0) == 1,
 		StatsPath:      getEnv("STATS_PATH", "/_throttle/stats"),
 		MetricsPath:    getEnv("METRICS_PATH", "/metrics"),
+		CacheTTL:       time.Duration(envInt("DISCOVERY_CACHE_TTL_SECONDS", defaultCacheTTL)) * time.Second,
+		CachePaths:     parseCachePaths(getEnv("DISCOVERY_CACHE_PATHS", defaultCachePaths)),
 	}
 	if c.MaxConcurrency < 1 {
 		c.MaxConcurrency = 1
@@ -77,7 +87,22 @@ func loadConfig() (*Config, error) {
 	if c.RPM < 1 {
 		c.RPM = 1
 	}
+	if c.CacheTTL < 0 {
+		c.CacheTTL = 0
+	}
 	return c, nil
+}
+
+// parseCachePaths splits the comma-separated allow-list of exact discovery
+// paths; empty/whitespace segments are ignored.
+func parseCachePaths(s string) map[string]bool {
+	m := map[string]bool{}
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			m[p] = true
+		}
+	}
+	return m
 }
 
 func getEnv(k, def string) string {
@@ -287,6 +312,86 @@ func (s *Scheduler) Stats() map[string]any {
 	}
 }
 
+// ---- discovery cache ---------------------------------------------------
+
+const (
+	cacheMaxEntries    = 128     // distinct cached responses
+	cacheMaxEntryBytes = 1 << 20 // 1 MiB stored body per entry; bigger = not stored
+)
+
+// cacheEntry is one stored upstream response. body is treated as immutable
+// after store() so handing the slice out read-only on a hit is race-free.
+type cacheEntry struct {
+	status      int
+	contentType string
+	body        []byte
+	expires     time.Time
+	key         string // mirrored for O(1) LRU eviction
+}
+
+// discoveryCache is a bounded TTL+LRU response cache for discovery GETs.
+// order front = most recently used; expiry is lazy (checked on get), so no
+// background reaper is needed and memory stays bounded.
+type discoveryCache struct {
+	mu      sync.RWMutex
+	ttl     time.Duration
+	entries map[string]*list.Element
+	order   *list.List // *cacheEntry, front = MRU
+}
+
+func newDiscoveryCache(ttl time.Duration) *discoveryCache {
+	return &discoveryCache{ttl: ttl, entries: map[string]*list.Element{}, order: list.New()}
+}
+
+func (c *discoveryCache) enabled() bool { return c != nil && c.ttl > 0 }
+
+// get returns a live entry for key, promoting it to MRU on a hit.
+func (c *discoveryCache) get(key string) (cacheEntry, bool) {
+	c.mu.RLock()
+	el, ok := c.entries[key]
+	if !ok {
+		c.mu.RUnlock()
+		return cacheEntry{}, false
+	}
+	e := el.Value.(*cacheEntry)
+	if time.Now().After(e.expires) {
+		c.mu.RUnlock()
+		return cacheEntry{}, false
+	}
+	val := *e // copy metadata; body slice shared read-only
+	c.mu.RUnlock()
+	c.mu.Lock()
+	if el2, ok := c.entries[key]; ok {
+		c.order.MoveToFront(el2)
+	}
+	c.mu.Unlock()
+	return val, true
+}
+
+// store saves one 2xx response under key (no-op when disabled or oversized).
+func (c *discoveryCache) store(key string, status int, contentType string, body []byte) {
+	if !c.enabled() || len(body) > cacheMaxEntryBytes {
+		return
+	}
+	e := &cacheEntry{
+		status: status, contentType: contentType,
+		body: body, expires: time.Now().Add(c.ttl), key: key,
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value = e
+		c.order.MoveToFront(el)
+		return
+	}
+	c.entries[key] = c.order.PushFront(e)
+	for c.order.Len() > cacheMaxEntries {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*cacheEntry).key)
+	}
+}
+
 // ---- metrics (Prometheus text exposition, stdlib-only) -------------------
 
 // Metrics collects what the Scheduler counters don't carry: queue-wait
@@ -300,6 +405,8 @@ type Metrics struct {
 	n            int64
 	upstreamErrs int64
 	clientAborts int64
+	cacheHits    int64
+	cacheMisses  int64
 
 	// per-completed-request mirrors of what the access log carries, in
 	// bounded-cardinality form: status code (finite set), total duration,
@@ -373,6 +480,22 @@ func (m *Metrics) ObserveClientAbort() {
 	m.mu.Unlock()
 }
 
+// ObserveCacheHit counts a discovery GET served straight from the cache,
+// without entering the scheduler queue.
+func (m *Metrics) ObserveCacheHit() {
+	m.mu.Lock()
+	m.cacheHits++
+	m.mu.Unlock()
+}
+
+// ObserveCacheMiss counts a discovery-eligible GET that had to be proxied
+// through the queue (cold cache or expired entry).
+func (m *Metrics) ObserveCacheMiss() {
+	m.mu.Lock()
+	m.cacheMisses++
+	m.mu.Unlock()
+}
+
 // Render writes Prometheus text format 0.0.4.
 func (m *Metrics) Render(s *Scheduler, w io.Writer) {
 	st := s.Stats()
@@ -418,6 +541,12 @@ func (m *Metrics) Render(s *Scheduler, w io.Writer) {
 	fmt.Fprintf(w, "# HELP gothrottle_client_aborts_total Responses cut short by client disconnects.\n"+
 		"# TYPE gothrottle_client_aborts_total counter\n"+
 		"gothrottle_client_aborts_total %d\n", m.clientAborts)
+	fmt.Fprintf(w, "# HELP gothrottle_discovery_cache_hits_total Discovery GETs served from cache (no queue).\n"+
+		"# TYPE gothrottle_discovery_cache_hits_total counter\n"+
+		"gothrottle_discovery_cache_hits_total %d\n", m.cacheHits)
+	fmt.Fprintf(w, "# HELP gothrottle_discovery_cache_misses_total Discovery GETs proxied through the queue (cache miss/expired).\n"+
+		"# TYPE gothrottle_discovery_cache_misses_total counter\n"+
+		"gothrottle_discovery_cache_misses_total %d\n", m.cacheMisses)
 	fmt.Fprintf(w, "# HELP gothrottle_responses_total Completed proxied requests by upstream response code.\n"+
 		"# TYPE gothrottle_responses_total counter\n")
 	codes := make([]string, 0, len(m.statuses))
@@ -573,6 +702,48 @@ func (s *statusRecorder) Flush() {
 	}
 }
 
+// captureWriter passes everything through and buffers the response body for
+// the discovery cache while it is provably storable: first status 2xx and
+// total bytes within cacheMaxEntryBytes. Any second WriteHeader (e.g. the
+// proxy ErrorHandler firing after a partial stream), a non-2xx status, or an
+// oversize body permanently disqualifies the response.
+type captureWriter struct {
+	http.ResponseWriter
+	status   int
+	storable bool
+	body     bytes.Buffer
+}
+
+func (c *captureWriter) WriteHeader(code int) {
+	if c.status != 0 {
+		c.storable = false // second header: response shape is no longer cacheable
+	} else {
+		c.status = code
+		c.storable = code >= 200 && code < 300
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *captureWriter) Write(b []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+		c.storable = true
+	}
+	if c.storable && c.body.Len()+len(b) <= cacheMaxEntryBytes {
+		c.body.Write(b)
+	} else {
+		c.storable = false
+	}
+	return c.ResponseWriter.Write(b)
+}
+
+// Flush forwards streaming (ReverseProxy needs it on the wrapped writer).
+func (c *captureWriter) Flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ---- proxy -------------------------------------------------------------
 
 func main() {
@@ -591,6 +762,19 @@ func main() {
 	sched := NewScheduler(cfg.MaxConcurrency, cfg.RPM, cfg.QueueLimit)
 	metrics := NewMetrics()
 
+	mux := buildHandler(cfg, sched, metrics, newDiscoveryCache(cfg.CacheTTL))
+
+	log.Printf("goThrottle listening %s -> %s (conc=%d rpm=%d maxWait=%s queueLimit=%d requireAuth=%t cacheTtl=%s cachePaths=%d)",
+		cfg.ListenAddr, cfg.UpstreamURL, cfg.MaxConcurrency, cfg.RPM, cfg.MaxWait, cfg.QueueLimit, cfg.RequireAuth,
+		cfg.CacheTTL, len(cfg.CachePaths))
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// buildHandler wires the full production stack (health/stats/metrics + the
+// throttled proxy with the discovery cache) behind one http.Handler, so
+// tests reuse the exact wiring.
+func buildHandler(cfg *Config, sched *Scheduler, metrics *Metrics, cache *discoveryCache) *http.ServeMux {
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(cfg.UpstreamURL)
@@ -636,6 +820,28 @@ func main() {
 			w.Write([]byte(`{"error":{"message":"goThrottle: missing credential","type":"auth_error"}}`))
 			return
 		}
+		// Discovery GETs (exact method + exact allow-listed path) are served
+		// from the TTL cache when warm — no queue, no rate slot, no
+		// concurrency slot. Keyed per credential so one key's model list is
+		// never visible to another.
+		cacheable := cache.enabled() && r.Method == http.MethodGet && cfg.CachePaths[r.URL.Path]
+		var cwr *captureWriter
+		if cacheable {
+			key := r.URL.Path + "|" + keyFingerprint(r)
+			if e, ok := cache.get(key); ok {
+				metrics.ObserveCacheHit()
+				if e.contentType != "" {
+					w.Header().Set("Content-Type", e.contentType)
+				}
+				w.WriteHeader(e.status)
+				w.Write(e.body)
+				log.Printf("cache hit %s | %s", r.URL.Path, clientInfo(r))
+				return
+			}
+			metrics.ObserveCacheMiss()
+			cwr = &captureWriter{ResponseWriter: w}
+			w = cwr
+		}
 		if err := sched.WaitCtx(r.Context(), cfg.MaxWait); err != nil {
 			waited := time.Since(start).Round(time.Millisecond)
 			if err == ErrClientGone {
@@ -658,14 +864,14 @@ func main() {
 			r = r.WithContext(ctx)
 		}
 		rp.ServeHTTP(w, r)
+		if cwr != nil && cwr.storable {
+			cache.store(r.URL.Path+"|"+keyFingerprint(r), cwr.status,
+				cwr.Header().Get("Content-Type"), bytes.Clone(cwr.body.Bytes()))
+		}
 		metrics.ObserveResponse(rec.status, time.Since(start), int64(rec.bytes), r.ContentLength)
 		log.Printf("done queued=%s dur=%s status=%d bytes=%d | %s",
 			queued.Round(time.Millisecond), time.Since(start).Round(time.Millisecond),
 			rec.status, rec.bytes, what)
 	})
-
-	log.Printf("goThrottle listening %s -> %s (conc=%d rpm=%d maxWait=%s queueLimit=%d requireAuth=%t)",
-		cfg.ListenAddr, cfg.UpstreamURL, cfg.MaxConcurrency, cfg.RPM, cfg.MaxWait, cfg.QueueLimit, cfg.RequireAuth)
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
-	log.Fatal(srv.ListenAndServe())
+	return mux
 }
